@@ -320,7 +320,8 @@ class MultiEncoder(nn.Module):
             for k, v in shapes.items()
             if len(v) in (1, 2) and re.match(mlp_keys, k)
         }
-        print("Encoder CNN shapes:", self.cnn_shapes)
+        print(f"{shapes=}")
+        print(f"Encoder CNN shapes ({cnn_keys=}):", self.cnn_shapes)
         print("Encoder MLP shapes:", self.mlp_shapes)
 
         self.outdim = 0
