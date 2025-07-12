@@ -111,7 +111,7 @@ dmc_vision:
   encoder: {mlp_keys: '$^', cnn_keys: 'image'}
   decoder: {mlp_keys: '$^', cnn_keys: 'image'}
 
-minotaur:
+theseus:
   steps: 1e6
   action_repeat: 1
   envs: 1

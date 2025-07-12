@@ -194,12 +194,29 @@ def make_env(config, mode, id):
         env = minecraft.make_env(task, size=config.size, break_speed=config.break_speed)
         env = wrappers.OneHotAction(env)
     elif suite == "minotaur":
-        print("Minotaur suite")
-        from minotaur.sim_labyrinth.mujoco import BallOnPlaneEnv
-        env = BallOnPlaneEnv(
-            reward_file="./minotaur/rewards/clicked_path_points_briobrown.png.npy", maze_name="briobrown", gui=False
-        )
-        env = wrappers.NormalizeActions(env)
+        if task == "briobrown":
+            from minotaur.sim_labyrinth.mujoco import BallOnPlaneEnv
+            env = BallOnPlaneEnv(
+                reward_file="./rewards/clicked_path_points_briobrown.png.npy", maze_name="briobrown", gui=False
+            )
+            env = wrappers.NormalizeActions(env)
+        elif task == "briowhiteeasy":
+            from minotaur.sim_labyrinth.mujoco import BallOnPlaneEnv
+            env = BallOnPlaneEnv(
+                reward_file="./rewards/clicked_path_points_brio_white_easy.png.npy", maze_name="brio_white_easy", gui=False
+            )
+            env = wrappers.NormalizeActions(env)
+        else:
+            raise RuntimeError()
+    elif suite == "minotaurreal":
+        if task == "briowhiteeasy":
+            from minotaur.real_labyrinth.real_env import RealLabyrinthEnv
+            env = RealLabyrinthEnv(
+                reward_file="./rewards/clicked_path_points_brio_white_easy.png.npy", maze_name="dummy", gui=True
+            )
+            env = wrappers.NormalizeActions(env)
+        else:
+            raise RuntimeError()
     else:
         raise NotImplementedError(suite)
     env = wrappers.TimeLimit(env, config.time_limit)
