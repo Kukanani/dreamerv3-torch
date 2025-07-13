@@ -212,14 +212,15 @@ def make_env(config, mode, id):
         if task == "briowhiteeasy":
             from minotaur.real_labyrinth.real_env import RealLabyrinthEnv
             env = RealLabyrinthEnv(
-                reward_file="./rewards/clicked_path_points_brio_white_easy.png.npy", maze_name="dummy", gui=True
+                reward_file="./rewards/clicked_path_points_brio_white_easy.png.npy", maze_name="dummy", gui=False
             )
             env = wrappers.NormalizeActions(env)
         else:
             raise RuntimeError()
     else:
         raise NotImplementedError(suite)
-    env = wrappers.TimeLimit(env, config.time_limit)
+    if config.time_limit:
+        env = wrappers.TimeLimit(env, config.time_limit)
     env = wrappers.SelectAction(env, key="action")
     env = wrappers.UUID(env)
     if suite == "minecraft":
@@ -260,7 +261,10 @@ def main(config):
     eval_eps = tools.load_episodes(directory, limit=1)
     make = lambda mode, id: make_env(config, mode, id)
     train_envs = [make("train", i) for i in range(config.envs)]
-    eval_envs = [make("eval", i) for i in range(config.envs)]
+    if config.reuse_env:
+        eval_envs = train_envs
+    else:
+        eval_envs = [make("eval", i) for i in range(config.envs)]
     if config.parallel:
         train_envs = [Parallel(env, "process") for env in train_envs]
         eval_envs = [Parallel(env, "process") for env in eval_envs]
@@ -324,38 +328,46 @@ def main(config):
 
     # make sure eval will be executed once after config.steps
     while agent._step < config.steps + config.eval_every:
-        logger.write()
-        if config.eval_episode_num > 0:
-            print("Start evaluation.")
-            eval_policy = functools.partial(agent, training=False)
-            tools.simulate(
-                eval_policy,
-                eval_envs,
-                eval_eps,
-                config.evaldir,
+        try:
+            logger.write()
+            if config.eval_episode_num > 0:
+                print("Start evaluation.")
+                eval_policy = functools.partial(agent, training=False)
+                tools.simulate(
+                    eval_policy,
+                    eval_envs,
+                    eval_eps,
+                    config.evaldir,
+                    logger,
+                    is_eval=True,
+                    episodes=config.eval_episode_num,
+                )
+                if config.video_pred_log:
+                    video_pred = agent._wm.video_pred(next(eval_dataset))
+                    logger.video("eval_openl", to_np(video_pred))
+            print("Start training.")
+            if config.reuse_env:
+                [e.reset()() for e in train_envs]
+            state = tools.simulate(
+                agent,
+                train_envs,
+                train_eps,
+                config.traindir,
                 logger,
-                is_eval=True,
-                episodes=config.eval_episode_num,
+                limit=config.dataset_size,
+                steps=config.eval_every,
+                state=state,
             )
-            if config.video_pred_log:
-                video_pred = agent._wm.video_pred(next(eval_dataset))
-                logger.video("eval_openl", to_np(video_pred))
-        print("Start training.")
-        state = tools.simulate(
-            agent,
-            train_envs,
-            train_eps,
-            config.traindir,
-            logger,
-            limit=config.dataset_size,
-            steps=config.eval_every,
-            state=state,
-        )
-        items_to_save = {
-            "agent_state_dict": agent.state_dict(),
-            "optims_state_dict": tools.recursively_collect_optim_state_dict(agent),
-        }
-        torch.save(items_to_save, logdir / "latest.pt")
+            items_to_save = {
+                "agent_state_dict": agent.state_dict(),
+                "optims_state_dict": tools.recursively_collect_optim_state_dict(agent),
+            }
+            torch.save(items_to_save, logdir / "latest.pt")
+        except KeyboardInterrupt as e:
+            for env in train_envs + eval_envs:
+                env.close()
+            raise
+
     for env in train_envs + eval_envs:
         try:
             env.close()
