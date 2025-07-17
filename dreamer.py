@@ -3,6 +3,7 @@ import functools
 import os
 import pathlib
 import sys
+import threading
 
 os.environ["MUJOCO_GL"] = "osmesa"
 
@@ -26,10 +27,11 @@ to_np = lambda x: x.detach().cpu().numpy()
 
 
 class Dreamer(nn.Module):
-    def __init__(self, obs_space, act_space, config, logger, dataset):
+    def __init__(self, obs_space, act_space, config, logger, training_logger, dataset):
         super(Dreamer, self).__init__()
         self._config = config
         self._logger = logger
+        self._training_logger = training_logger
         self._should_log = tools.Every(config.log_every)
         batch_steps = config.batch_size * config.batch_length
         self._should_train = tools.Every(batch_steps / config.train_ratio)
@@ -41,8 +43,15 @@ class Dreamer(nn.Module):
         self._step = logger.step // config.action_repeat
         self._update_count = 0
         self._dataset = dataset
-        self._wm = models.WorldModel(obs_space, act_space, self._step, config)
-        self._task_behavior = models.ImagBehavior(config, self._wm)
+
+        wm_lock = threading.Lock()
+        actor_lock = threading.Lock()
+        value_lock = threading.Lock()
+        self.cache_lock = threading.Lock()
+
+
+        self._wm = models.WorldModel(obs_space, act_space, self._step, config, wm_lock)
+        self._task_behavior = models.ImagBehavior(config, self._wm, actor_lock, value_lock)
         if (
             config.compile and os.name != "nt"
         ):  # compilation is not supported on windows
@@ -56,26 +65,6 @@ class Dreamer(nn.Module):
         )[config.expl_behavior]().to(self._config.device)
 
     def __call__(self, obs, reset, state=None, training=True):
-        step = self._step
-        if training:
-            steps = (
-                self._config.pretrain
-                if self._should_pretrain()
-                else self._should_train(step)
-            )
-            for _ in range(steps):
-                self._train(next(self._dataset))
-                self._update_count += 1
-                self._metrics["update_count"] = self._update_count
-            if self._should_log(step):
-                for name, values in self._metrics.items():
-                    self._logger.scalar(name, float(np.mean(values)))
-                    self._metrics[name] = []
-                if self._config.video_pred_log:
-                    openl = self._wm.video_pred(next(self._dataset))
-                    self._logger.video("train_openl", to_np(openl))
-                self._logger.write(fps=True)
-
         policy_output, state = self._policy(obs, state, training)
 
         if training:
@@ -83,17 +72,45 @@ class Dreamer(nn.Module):
             self._logger.step = self._config.action_repeat * self._step
         return policy_output, state
 
+    def training_thread_call(self, training=True, n_steps = 1):
+        step = self._step
+        if training:
+            # steps = (
+            #     self._config.pretrain
+            #     if self._should_pretrain()
+            #     else self._should_train(step)
+            # )
+            # for _ in range(steps):
+            for n in range(n_steps):
+                d = None
+                with self.cache_lock:
+                    d = next(self._dataset)
+                self._train(d)
+                self._update_count += 1
+                self._metrics["update_count"] = self._update_count
+            if self._should_log(step) and n_steps > 0:
+                self._training_logger.step = self._config.action_repeat * self._step
+                for name, values in self._metrics.items():
+                    self._training_logger.scalar(name, float(np.mean(values)))
+                    self._metrics[name] = []
+                if self._config.video_pred_log:
+                    with self.cache_lock:
+                        d = next(self._dataset)
+                    openl = self._wm.video_pred(d)
+                    self._training_logger.video("train_openl", to_np(openl))
+                self._training_logger.write(fps=True)
+
     def _policy(self, obs, state, training):
         if state is None:
             latent = action = None
         else:
             latent, action = state
         obs = self._wm.preprocess(obs)
-        embed = self._wm.encoder(obs)
-        latent, _ = self._wm.dynamics.obs_step(latent, action, embed, obs["is_first"])
+        embed = self._wm.encode(obs)
+        latent, _ = self._wm.dynamics_obs_step(latent, action, embed, obs["is_first"])
         if self._config.eval_state_mean:
             latent["stoch"] = latent["mean"]
-        feat = self._wm.dynamics.get_feat(latent)
+        feat = self._wm.dynamics_get_feat(latent)
         if not training:
             actor = self._task_behavior.actor(feat)
             action = actor.mode()
@@ -120,7 +137,7 @@ class Dreamer(nn.Module):
         metrics.update(mets)
         start = post
         reward = lambda f, s, a: self._wm.heads["reward"](
-            self._wm.dynamics.get_feat(s)
+            self._wm.dynamics_get_feat(s)
         ).mode()
         metrics.update(self._task_behavior._train(start, reward)[-1])
         if self._config.expl_behavior != "greedy":
@@ -195,15 +212,15 @@ def make_env(config, mode, id):
         env = wrappers.OneHotAction(env)
     elif suite == "minotaur":
         if task == "briobrown":
-            from minotaur.sim_labyrinth.mujoco import BallOnPlaneEnv
-            env = BallOnPlaneEnv(
-                reward_file="./rewards/clicked_path_points_briobrown.png.npy", maze_name="briobrown", gui=False
+            from minotaur.sim_labyrinth.mujoco import MujocoLabyrinthEnv
+            env = MujocoLabyrinthEnv(
+                reward_file="./rewards/clicked_path_points_briobrown.png.npy", maze_name="briobrown", gui=True
             )
             env = wrappers.NormalizeActions(env)
         elif task == "briowhiteeasy":
-            from minotaur.sim_labyrinth.mujoco import BallOnPlaneEnv
-            env = BallOnPlaneEnv(
-                reward_file="./rewards/clicked_path_points_brio_white_easy.png.npy", maze_name="brio_white_easy", gui=False
+            from minotaur.sim_labyrinth.mujoco import MujocoLabyrinthEnv
+            env = MujocoLabyrinthEnv(
+                reward_file="./rewards/clicked_path_points_brio_white_easy.png.npy", maze_name="brio_white_easy", gui=True
             )
             env = wrappers.NormalizeActions(env)
         else:
@@ -212,7 +229,7 @@ def make_env(config, mode, id):
         if task == "briowhiteeasy":
             from minotaur.real_labyrinth.real_env import RealLabyrinthEnv
             env = RealLabyrinthEnv(
-                reward_file="./rewards/clicked_path_points_brio_white_easy.png.npy", maze_name="dummy", gui=False
+                reward_file="./rewards/clicked_path_points_brio_white_easy.png.npy", maze_name="dummy", gui=True
             )
             env = wrappers.NormalizeActions(env)
         else:
@@ -247,6 +264,7 @@ def main(config):
     step = count_steps(config.traindir)
     # step in logger is environmental step
     logger = tools.Logger(logdir, config.action_repeat * step)
+    training_logger = tools.Logger(logdir, config.action_repeat * step)
 
     print("Create envs.")
     if config.offline_traindir:
@@ -303,20 +321,23 @@ def main(config):
             train_eps,
             config.traindir,
             logger,
+            threading.Lock(),
             limit=config.dataset_size,
             steps=prefill,
         )
         logger.step += prefill * config.action_repeat
         print(f"Logger: ({logger.step} steps).")
 
-    print("Simulate agent.")
     train_dataset = make_dataset(train_eps, config)
     eval_dataset = make_dataset(eval_eps, config)
+
+    print("Simulate agent.")
     agent = Dreamer(
         train_envs[0].observation_space,
         train_envs[0].action_space,
         config,
         logger,
+        training_logger,
         train_dataset,
     ).to(config.device)
     agent.requires_grad_(requires_grad=False)
@@ -325,6 +346,9 @@ def main(config):
         agent.load_state_dict(checkpoint["agent_state_dict"])
         tools.recursively_load_optim_state_dict(agent, checkpoint["optims_state_dict"])
         agent._should_pretrain._once = False
+
+    if agent._should_pretrain():
+        agent.training_thread_call(training=True, n_steps=agent._config.pretrain)
 
     # make sure eval will be executed once after config.steps
     while agent._step < config.steps + config.eval_every:
@@ -339,6 +363,7 @@ def main(config):
                     eval_eps,
                     config.evaldir,
                     logger,
+                    agent.cache_lock,
                     is_eval=True,
                     episodes=config.eval_episode_num,
                 )
@@ -354,6 +379,7 @@ def main(config):
                 train_eps,
                 config.traindir,
                 logger,
+                agent.cache_lock,
                 limit=config.dataset_size,
                 steps=config.eval_every,
                 state=state,

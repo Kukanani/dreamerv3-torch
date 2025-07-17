@@ -27,11 +27,13 @@ class RewardEMA:
 
 
 class WorldModel(nn.Module):
-    def __init__(self, obs_space, act_space, step, config):
+    def __init__(self, obs_space, act_space, step, config, wm_lock):
         super(WorldModel, self).__init__()
         self._step = step
         self._use_amp = True if config.precision == 16 else False
         self._config = config
+        self._wm_lock = wm_lock
+
         shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}
         self.encoder = networks.MultiEncoder(shapes, **config.encoder)
         self.embed_size = self.encoder.outdim
@@ -105,6 +107,18 @@ class WorldModel(nn.Module):
             cont=config.cont_head["loss_scale"],
         )
 
+    def dynamics_get_feat(self, s):
+        with self._wm_lock:
+            return self.dynamics.get_feat(s)
+
+    def dynamics_obs_step(self, *args):
+        with self._wm_lock:
+            return self.dynamics.obs_step(*args)
+
+    def encode(self, *args):
+        with self._wm_lock:
+            return self.encoder(*args)
+
     def _train(self, data):
         # action (batch_size, batch_length, act_dim)
         # image (batch_size, batch_length, h, w, ch)
@@ -121,6 +135,7 @@ class WorldModel(nn.Module):
                 kl_free = self._config.kl_free
                 dyn_scale = self._config.dyn_scale
                 rep_scale = self._config.rep_scale
+
                 kl_loss, kl_value, dyn_loss, rep_loss = self.dynamics.kl_loss(
                     post, prior, kl_free, dyn_scale, rep_scale
                 )
@@ -135,17 +150,21 @@ class WorldModel(nn.Module):
                         preds.update(pred)
                     else:
                         preds[name] = pred
-                losses = {}
-                for name, pred in preds.items():
-                    loss = -pred.log_prob(data[name])
-                    assert loss.shape == embed.shape[:2], (name, loss.shape)
-                    losses[name] = loss
-                scaled = {
-                    key: value * self._scales.get(key, 1.0)
-                    for key, value in losses.items()
-                }
-                model_loss = sum(scaled.values()) + kl_loss
-            metrics = self._model_opt(torch.mean(model_loss), self.parameters())
+                    losses = {}
+                    for name, pred in preds.items():
+                        loss = -pred.log_prob(data[name])
+                        assert loss.shape == embed.shape[:2], (name, loss.shape)
+                        losses[name] = loss
+                    scaled = {
+                        key: value * self._scales.get(key, 1.0)
+                        for key, value in losses.items()
+                    }
+                    model_loss = sum(scaled.values()) + kl_loss
+            # print("acquiring world model lock for training")
+            with self._wm_lock:
+                # print("world model lock acquired")
+                metrics = self._model_opt(torch.mean(model_loss), self.parameters())
+                # print("releasing world model lock for training")
 
         metrics.update({f"{name}_loss": to_np(loss) for name, loss in losses.items()})
         metrics["kl_free"] = kl_free
@@ -190,19 +209,20 @@ class WorldModel(nn.Module):
 
     def video_pred(self, data):
         data = self.preprocess(data)
-        embed = self.encoder(data)
+        with self._wm_lock:
+            embed = self.encoder(data)
 
-        states, _ = self.dynamics.observe(
-            embed[:6, :5], data["action"][:6, :5], data["is_first"][:6, :5]
-        )
-        recon = self.heads["decoder"](self.dynamics.get_feat(states))["image"].mode()[
-            :6
-        ]
-        reward_post = self.heads["reward"](self.dynamics.get_feat(states)).mode()[:6]
-        init = {k: v[:, -1] for k, v in states.items()}
-        prior = self.dynamics.imagine_with_action(data["action"][:6, 5:], init)
-        openl = self.heads["decoder"](self.dynamics.get_feat(prior))["image"].mode()
-        reward_prior = self.heads["reward"](self.dynamics.get_feat(prior)).mode()
+            states, _ = self.dynamics.observe(
+                embed[:6, :5], data["action"][:6, :5], data["is_first"][:6, :5]
+            )
+            recon = self.heads["decoder"](self.dynamics.get_feat(states))["image"].mode()[
+                :6
+            ]
+            reward_post = self.heads["reward"](self.dynamics.get_feat(states)).mode()[:6]
+            init = {k: v[:, -1] for k, v in states.items()}
+            prior = self.dynamics.imagine_with_action(data["action"][:6, 5:], init)
+            openl = self.heads["decoder"](self.dynamics.get_feat(prior))["image"].mode()
+            reward_prior = self.heads["reward"](self.dynamics.get_feat(prior)).mode()
         # observed image is given until 5 steps
         model = torch.cat([recon[:, :5], openl], 1)
         truth = data["image"][:6]
@@ -213,11 +233,14 @@ class WorldModel(nn.Module):
 
 
 class ImagBehavior(nn.Module):
-    def __init__(self, config, world_model):
+    def __init__(self, config, world_model, actor_lock, value_lock):
         super(ImagBehavior, self).__init__()
         self._use_amp = True if config.precision == 16 else False
         self._config = config
         self._world_model = world_model
+        self._actor_lock = actor_lock
+        self._value_lock = value_lock
+
         if config.dyn_discrete:
             feat_size = config.dyn_stoch * config.dyn_discrete + config.dyn_deter
         else:
@@ -294,11 +317,12 @@ class ImagBehavior(nn.Module):
 
         with tools.RequiresGrad(self.actor):
             with torch.cuda.amp.autocast(self._use_amp):
-                imag_feat, imag_state, imag_action = self._imagine(
-                    start, self.actor, self._config.imag_horizon
-                )
-                reward = objective(imag_feat, imag_state, imag_action)
-                actor_ent = self.actor(imag_feat).entropy()
+                with self._actor_lock:
+                    imag_feat, imag_state, imag_action = self._imagine(
+                        start, self.actor, self._config.imag_horizon
+                    )
+                    reward = objective(imag_feat, imag_state, imag_action)
+                    actor_ent = self.actor(imag_feat).entropy()
                 state_ent = self._world_model.dynamics.get_dist(imag_state).entropy()
                 # this target is not scaled by ema or sym_log.
                 target, weights, base = self._compute_target(
@@ -318,7 +342,8 @@ class ImagBehavior(nn.Module):
 
         with tools.RequiresGrad(self.value):
             with torch.cuda.amp.autocast(self._use_amp):
-                value = self.value(value_input[:-1].detach())
+                with self._value_lock:
+                    value = self.value(value_input[:-1].detach())
                 target = torch.stack(target, dim=1)
                 # (time, batch, 1), (time, batch, 1) -> (time, batch)
                 value_loss = -value.log_prob(target.detach())
@@ -341,8 +366,10 @@ class ImagBehavior(nn.Module):
             metrics.update(tools.tensorstats(imag_action, "imag_action"))
         metrics["actor_entropy"] = to_np(torch.mean(actor_ent))
         with tools.RequiresGrad(self):
-            metrics.update(self._actor_opt(actor_loss, self.actor.parameters()))
-            metrics.update(self._value_opt(value_loss, self.value.parameters()))
+            with self._actor_lock:
+                metrics.update(self._actor_opt(actor_loss, self.actor.parameters()))
+            with self._value_lock:
+                metrics.update(self._value_opt(value_loss, self.value.parameters()))
         return imag_feat, imag_state, imag_action, weights, metrics
 
     def _imagine(self, start, policy, horizon):
@@ -371,7 +398,8 @@ class ImagBehavior(nn.Module):
             discount = self._config.discount * self._world_model.heads["cont"](inp).mean
         else:
             discount = self._config.discount * torch.ones_like(reward)
-        value = self.value(imag_feat).mode()
+        with self._value_lock:
+            value = self.value(imag_feat).mode()
         target = tools.lambda_return(
             reward[1:],
             value[:-1],
@@ -395,7 +423,8 @@ class ImagBehavior(nn.Module):
     ):
         metrics = {}
         inp = imag_feat.detach()
-        policy = self.actor(inp)
+        with self._actor_lock:
+            policy = self.actor(inp)
         # Q-val for actor is not transformed using symlog
         target = torch.stack(target, dim=1)
         if self._config.reward_EMA:
@@ -410,15 +439,17 @@ class ImagBehavior(nn.Module):
         if self._config.imag_gradient == "dynamics":
             actor_target = adv
         elif self._config.imag_gradient == "reinforce":
-            actor_target = (
-                policy.log_prob(imag_action)[:-1][:, :, None]
-                * (target - self.value(imag_feat[:-1]).mode()).detach()
-            )
+            with self.actor_lock:
+                actor_target = (
+                    policy.log_prob(imag_action)[:-1][:, :, None]
+                    * (target - self.value(imag_feat[:-1]).mode()).detach()
+                )
         elif self._config.imag_gradient == "both":
-            actor_target = (
-                policy.log_prob(imag_action)[:-1][:, :, None]
-                * (target - self.value(imag_feat[:-1]).mode()).detach()
-            )
+            with self.actor_lock:
+                actor_target = (
+                    policy.log_prob(imag_action)[:-1][:, :, None]
+                    * (target - self.value(imag_feat[:-1]).mode()).detach()
+                )
             mix = self._config.imag_gradient_mix
             actor_target = mix * target + (1 - mix) * actor_target
             metrics["imag_gradient_mix"] = mix
@@ -431,6 +462,7 @@ class ImagBehavior(nn.Module):
         if self._config.critic["slow_target"]:
             if self._updates % self._config.critic["slow_target_update"] == 0:
                 mix = self._config.critic["slow_target_fraction"]
-                for s, d in zip(self.value.parameters(), self._slow_value.parameters()):
-                    d.data = mix * s.data + (1 - mix) * d.data
+                with self._value_lock:
+                    for s, d in zip(self.value.parameters(), self._slow_value.parameters()):
+                        d.data = mix * s.data + (1 - mix) * d.data
             self._updates += 1

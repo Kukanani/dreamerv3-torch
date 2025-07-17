@@ -9,6 +9,8 @@ import time
 import random
 
 import numpy as np
+import threading
+import types
 
 import torch
 from torch import nn
@@ -124,6 +126,10 @@ class Logger:
         value = value.transpose(1, 4, 2, 0, 3).reshape((1, T, C, H, B * W))
         self._writer.add_video(name, value, step, 16)
 
+def training_worker(agent):
+    t = threading.current_thread()
+    while getattr(t, "do_run", True):
+        agent.training_thread_call(training=True)
 
 def simulate(
     agent,
@@ -131,13 +137,15 @@ def simulate(
     cache,
     directory,
     logger,
+    cache_lock,
     is_eval=False,
     limit=None,
     steps=0,
     episodes=0,
     state=None,
 ):
-    # initialize or unpack simulation state
+
+   # initialize or unpack simulation state
     if state is None:
         step, episode = 0, 0
         done = np.ones(len(envs), bool)
@@ -147,6 +155,14 @@ def simulate(
         reward = [0] * len(envs)
     else:
         step, episode, done, length, obs, agent_state, reward = state
+
+    training_thread = None
+    if not is_eval and not isinstance(agent, (types.FunctionType, types.BuiltinFunctionType)):
+        training_thread = threading.Thread(target=training_worker, args=(agent,))
+        training_thread.start()
+        print("Started training thread")
+    else:
+        print("No need to start training thread, is not eval, or agent is a callable (that would not have a training call function)")
     while (steps and step < steps) or (episodes and episode < episodes):
         # reset envs if necessary
         if done.any():
@@ -160,7 +176,8 @@ def simulate(
                 t["reward"] = 0.0
                 t["discount"] = 1.0
                 # initial state should be added to cache
-                add_to_cache(cache, envs[index].id, t)
+                with cache_lock:
+                    add_to_cache(cache, envs[index].id, t)
                 # replace obs with done by initial state
                 obs[index] = result
         # step agents
@@ -196,7 +213,8 @@ def simulate(
                 transition["action"] = a
             transition["reward"] = r
             transition["discount"] = info.get("discount", np.array(1 - float(d)))
-            add_to_cache(cache, env.id, transition)
+            with cache_lock:
+                add_to_cache(cache, env.id, transition)
 
         if done.any():
             indices = [index for index, d in enumerate(done) if d]
@@ -241,6 +259,10 @@ def simulate(
                         logger.scalar(f"eval_episodes", len(eval_scores))
                         logger.write(step=logger.step)
                         eval_done = True
+    if training_thread is not None:
+        print("stopping training thread")
+        training_thread.do_run = False
+        training_thread.join()
     if is_eval:
         # keep only last item for saving memory. this cache is used for video_pred later
         while len(cache) > 1:
