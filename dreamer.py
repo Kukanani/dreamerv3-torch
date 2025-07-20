@@ -49,12 +49,9 @@ class Dreamer(nn.Module):
         value_lock = threading.Lock()
         self.cache_lock = threading.Lock()
 
-
         self._wm = models.WorldModel(obs_space, act_space, self._step, config, wm_lock)
         self._task_behavior = models.ImagBehavior(config, self._wm, actor_lock, value_lock)
-        if (
-            config.compile and os.name != "nt"
-        ):  # compilation is not supported on windows
+        if config.compile and os.name != "nt":  # compilation is not supported on windows
             self._wm = torch.compile(self._wm)
             self._task_behavior = torch.compile(self._task_behavior)
         reward = lambda f, s, a: self._wm.heads["reward"](f).mean()
@@ -72,7 +69,7 @@ class Dreamer(nn.Module):
             self._logger.step = self._config.action_repeat * self._step
         return policy_output, state
 
-    def training_thread_call(self, training=True, n_steps = 1):
+    def training_thread_call(self, training=True, n_steps=1):
         step = self._step
         if training:
             # steps = (
@@ -124,9 +121,7 @@ class Dreamer(nn.Module):
         latent = {k: v.detach() for k, v in latent.items()}
         action = action.detach()
         if self._config.actor["dist"] == "onehot_gumble":
-            action = torch.one_hot(
-                torch.argmax(action, dim=-1), self._config.num_actions
-            )
+            action = torch.one_hot(torch.argmax(action, dim=-1), self._config.num_actions) # type: ignore
         policy_output = {"action": action, "logprob": logprob}
         state = (latent, action)
         return policy_output, state
@@ -136,9 +131,7 @@ class Dreamer(nn.Module):
         post, context, mets = self._wm._train(data)
         metrics.update(mets)
         start = post
-        reward = lambda f, s, a: self._wm.heads["reward"](
-            self._wm.dynamics_get_feat(s)
-        ).mode()
+        reward = lambda f, s, a: self._wm.heads["reward"](self._wm.dynamics_get_feat(s)).mode()
         metrics.update(self._task_behavior._train(start, reward)[-1])
         if self._config.expl_behavior != "greedy":
             mets = self._expl_behavior.train(start, context, data)[-1]
@@ -165,9 +158,7 @@ def make_env(config, mode, id):
     if suite == "dmc":
         import envs.dmc as dmc
 
-        env = dmc.DeepMindControl(
-            task, config.action_repeat, config.size, seed=config.seed + id
-        )
+        env = dmc.DeepMindControl(task, config.action_repeat, config.size, seed=config.seed + id)
         env = wrappers.NormalizeActions(env)
     elif suite == "atari":
         import envs.atari as atari
@@ -213,14 +204,18 @@ def make_env(config, mode, id):
     elif suite == "minotaur":
         if task == "briobrown":
             from minotaur.sim_labyrinth.mujoco import MujocoLabyrinthEnv
+
             env = MujocoLabyrinthEnv(
-                reward_file="./rewards/clicked_path_points_briobrown.png.npy", maze_name="briobrown", gui=True
+                reward_file="./rewards/clicked_path_points_briobrown.png.npy", maze_name="briobrown", gui=False
             )
             env = wrappers.NormalizeActions(env)
         elif task == "briowhiteeasy":
             from minotaur.sim_labyrinth.mujoco import MujocoLabyrinthEnv
+
             env = MujocoLabyrinthEnv(
-                reward_file="./rewards/clicked_path_points_brio_white_easy.png.npy", maze_name="brio_white_easy", gui=True
+                reward_file="./rewards/clicked_path_points_brio_white_easy.png.npy",
+                maze_name="brio_white_easy",
+                gui=False,
             )
             env = wrappers.NormalizeActions(env)
         else:
@@ -228,6 +223,7 @@ def make_env(config, mode, id):
     elif suite == "minotaurreal":
         if task == "briowhiteeasy":
             from minotaur.real_labyrinth.real_env import RealLabyrinthEnv
+
             env = RealLabyrinthEnv(
                 reward_file="./rewards/clicked_path_points_brio_white_easy.png.npy", maze_name="dummy", gui=True
             )
@@ -298,9 +294,7 @@ def main(config):
         prefill = max(0, config.prefill - count_steps(config.traindir))
         print(f"Prefill dataset ({prefill} steps).")
         if hasattr(acts, "discrete"):
-            random_actor = tools.OneHotDist(
-                torch.zeros(config.num_actions).repeat(config.envs, 1)
-            )
+            random_actor = tools.OneHotDist(torch.zeros(config.num_actions).repeat(config.envs, 1))
         else:
             random_actor = torchd.independent.Independent(
                 torchd.uniform.Uniform(
@@ -405,9 +399,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--configs", nargs="+")
     args, remaining = parser.parse_known_args()
-    configs = yaml.safe_load(
-        (pathlib.Path(sys.argv[0]).parent / "configs.yaml").read_text()
-    )
+    configs = yaml.safe_load((pathlib.Path(sys.argv[0]).parent / "configs.yaml").read_text())
 
     def recursive_update(base, update):
         for key, value in update.items():
