@@ -1,12 +1,11 @@
-import datetime
 import collections
 import io
 import os
 import json
 import pathlib
-import re
 import time
 import random
+from copy import deepcopy
 
 import numpy as np
 import threading
@@ -18,8 +17,8 @@ from torch.nn import functional as F
 from torch import distributions as torchd
 from torch.utils.tensorboard import SummaryWriter
 
-
-to_np = lambda x: x.detach().cpu().numpy()
+def to_np(x):
+    return x.detach().cpu().numpy()
 
 
 def symlog(x):
@@ -131,6 +130,32 @@ def training_worker(agent):
     while getattr(t, "do_run", True):
         agent.training_thread_call(training=True)
 
+def flip(transition, flip_spec):
+    flip_x, flip_y = flip_spec
+    if not flip_x and not flip_y:
+        return transition
+    flipped_transition = deepcopy(transition)
+    if flip_x:
+        flipped_transition["board_angle"][0] *= -1
+        # flipped_transition["board_angle_x"] *= -1
+        flipped_transition["position"][0] = 1 - flipped_transition["position"][0]
+        flipped_transition["closest_points"][::2] = 1 - flipped_transition["closest_points"][::2]
+        # flipped_transition["closest"][::2] = 1 - flipped_transition["closest"][::2]
+        flipped_transition["image"] = np.flip(flipped_transition["image"], 1)
+        if "action" in flipped_transition:
+            flipped_transition["action"][0] *= -1
+    if flip_y:
+        flipped_transition["board_angle"][1] *= -1
+        # flipped_transition["board_angle_y"] *= -1
+        flipped_transition["position"][1] = 1 - flipped_transition["position"][1]
+        flipped_transition["closest_points"][1::2] = 1 - flipped_transition["closest_points"][1::2]
+        # flipped_transition["closest"][1::2] = 1 - flipped_transition["closest"][1::2]
+        flipped_transition["image"] = np.flip(flipped_transition["image"], 0)
+        if "action" in flipped_transition:
+            flipped_transition["action"][1] *= -1
+    return flipped_transition
+
+flip_specs = ((False, False), (False, True), (True, False), (True, True))
 def simulate(
     agent,
     envs,
@@ -163,6 +188,10 @@ def simulate(
         print("Started training thread")
     else:
         print("No need to start training thread, is not eval, or agent is a callable (that would not have a training call function)")
+    eval_lengths = []
+    eval_scores = []
+    eval_done = False
+    video = None
     while (steps and step < steps) or (episodes and episode < episodes):
         # reset envs if necessary
         if done.any():
@@ -176,8 +205,10 @@ def simulate(
                 t["reward"] = 0.0
                 t["discount"] = 1.0
                 # initial state should be added to cache
-                with cache_lock:
-                    add_to_cache(cache, envs[index].id, t)
+                for flip_idx, flip_spec in enumerate(flip_specs):
+                    flipped_transition = flip(t, flip_spec)
+                    with cache_lock:
+                        add_to_cache(cache, envs[index].id  + "_" + str(flip_idx), flipped_transition)
                 # replace obs with done by initial state
                 obs[index] = result
         # step agents
@@ -213,52 +244,54 @@ def simulate(
                 transition["action"] = a
             transition["reward"] = r
             transition["discount"] = info.get("discount", np.array(1 - float(d)))
-            with cache_lock:
-                add_to_cache(cache, env.id, transition)
+            for flip_idx, flip_spec in enumerate(flip_specs):
+                flipped_transition = flip(transition, flip_spec)
+                with cache_lock:
+                    add_to_cache(cache, env.id + "_" + str(flip_idx), flipped_transition)
 
+        score = -1
         if done.any():
             indices = [index for index, d in enumerate(done) if d]
             # logging for done episode
             for i in indices:
-                save_episodes(directory, {envs[i].id: cache[envs[i].id]})
-                length = len(cache[envs[i].id]["reward"]) - 1
-                score = float(np.array(cache[envs[i].id]["reward"]).sum())
-                video = cache[envs[i].id]["image"]
-                # record logs given from environments
-                for key in list(cache[envs[i].id].keys()):
-                    if "log_" in key:
-                        logger.scalar(
-                            key, float(np.array(cache[envs[i].id][key]).sum())
-                        )
-                        # log items won't be used later
-                        cache[envs[i].id].pop(key)
+                for flip_idx, flip_spec in enumerate(flip_specs):
+                    eid = envs[i].id + "_" + str(flip_idx)
+                    save_episodes(directory, {eid: cache[eid]})
+                    length = len(cache[eid]["reward"]) - 1
+                    score = float(np.array(cache[eid]["reward"]).sum())
+                    video = cache[eid]["image"]
+                    # record logs given from environments
+                    for key in list(cache[eid].keys()):
+                        if "log_" in key:
+                            logger.scalar(
+                                key, float(np.array(cache[eid][key]).sum())
+                            )
+                            # log items won't be used later
+                            cache[eid].pop(key)
 
-                if not is_eval:
-                    step_in_dataset = erase_over_episodes(cache, limit)
-                    logger.scalar(f"dataset_size", step_in_dataset)
-                    logger.scalar(f"train_return", score)
-                    logger.scalar(f"train_length", length)
-                    logger.scalar(f"train_episodes", len(cache))
+            if not is_eval:
+                step_in_dataset = erase_over_episodes(cache, limit)
+                logger.scalar("dataset_size", step_in_dataset)
+                logger.scalar("train_return", score)
+                logger.scalar("train_length", length)
+                logger.scalar("train_episodes", len(cache))
+                logger.write(step=logger.step)
+            else:
+                # start counting scores for evaluation
+                eval_scores.append(score)
+                eval_lengths.append(length)
+
+                score = sum(eval_scores) / len(eval_scores)
+                length = sum(eval_lengths) / len(eval_lengths)
+                if video:
+                    logger.video("eval_policy", np.array(video)[None])
+
+                if len(eval_scores) >= episodes and not eval_done:
+                    logger.scalar("eval_return", score)
+                    logger.scalar("eval_length", length)
+                    logger.scalar("eval_episodes", len(eval_scores))
                     logger.write(step=logger.step)
-                else:
-                    if not "eval_lengths" in locals():
-                        eval_lengths = []
-                        eval_scores = []
-                        eval_done = False
-                    # start counting scores for evaluation
-                    eval_scores.append(score)
-                    eval_lengths.append(length)
-
-                    score = sum(eval_scores) / len(eval_scores)
-                    length = sum(eval_lengths) / len(eval_lengths)
-                    logger.video(f"eval_policy", np.array(video)[None])
-
-                    if len(eval_scores) >= episodes and not eval_done:
-                        logger.scalar(f"eval_return", score)
-                        logger.scalar(f"eval_length", length)
-                        logger.scalar(f"eval_episodes", len(eval_scores))
-                        logger.write(step=logger.step)
-                        eval_done = True
+                    eval_done = True
     if training_thread is not None:
         print("stopping training thread")
         training_thread.do_run = False

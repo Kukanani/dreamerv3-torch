@@ -122,6 +122,7 @@ theseus:
   decoder: {mlp_keys: '.*', cnn_keys: 'image'}
   reuse_env: True
   time_limit: 1000
+  dataset_size: 4000000
 
 theseus_sim:
   steps: 1e6
@@ -132,6 +133,7 @@ theseus_sim:
   decoder: {mlp_keys: '.*', cnn_keys: 'image'}
   reuse_env: False
   time_limit: 1000
+  dataset_size: 4000000
 
 crafter:
   task: crafter_reward
