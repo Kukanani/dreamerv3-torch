@@ -113,7 +113,7 @@ dmc_vision:
   decoder: {mlp_keys: '$^', cnn_keys: 'image'}
 
 theseus:
-  steps: 1e6
+  steps: 1e7
   action_repeat: 1
   envs: 1
   train_ratio: 128
@@ -125,7 +125,7 @@ theseus:
   dataset_size: 4000000
 
 theseus_sim:
-  steps: 1e6
+  steps: 1e7
   action_repeat: 1
   envs: 1
   video_pred_log: true
