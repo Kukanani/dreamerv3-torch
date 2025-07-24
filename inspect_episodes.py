@@ -13,18 +13,18 @@ train_eps = tools.load_episodes("/home/adam/adam/1_projects/labyrinth/minotaur/l
 generator = tools.sample_episodes(train_eps, 64)
 dataset = tools.from_generator(generator, 1)
 
-ep_original = next(dataset)
-ep_original = next(dataset)
-ep_original = next(dataset)
-ep_original = next(dataset)
-ep_original = next(dataset)
+# ep_original = next(dataset)
+# ep_original = next(dataset)
+# ep_original = next(dataset)
+# ep_original = next(dataset)
+# ep_original = next(dataset)
 while True:
     print("NEXT")
     ep_original = next(dataset)
 
     # ep_original = np.load("home/adam/adam/1_projects/labyrinth/minotaur/logdir/minotaur_briowhiteeasy_29/train_eps/20250722T043838-26cd974c43254f28a0c87d75d850eab9_0-304.npz")
     # ep_flip_x = np.load("home/adam/adam/1_projects/labyrinth/minotaur/logdir/minotaur_briowhiteeasy_29/train_eps/20250722T043838-26cd974c43254f28a0c87d75d850eab9_2-304.npz")
-    list(ep_original.keys())
+    print(list(ep_original.keys()))
     ep = ep_original
     ep = {k: v[0] for k, v in ep.items()}
 
@@ -48,6 +48,8 @@ while True:
     plt.close()
 
     for i in range(0, 64, 1):
+        print(f"{i=}")
+        print(f"{ep['is_first'][i]=}")
         img = ep["image"][i]
         pos = ep["position"][i]
         closest_points = ep["closest_points"][i]
